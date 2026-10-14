@@ -51,6 +51,8 @@ pub struct Vr {
     zoom_changed: Instant,
     running: bool,
     focused: bool,
+    last_skip: Option<(&'static str, Instant)>,
+    logged_fov: bool,
     events: xr::EventDataBuffer,
     stats_since: Instant,
     stats_frames: u32,
@@ -372,6 +374,8 @@ impl Vr {
             zoom_changed: Instant::now(),
             running: false,
             focused: false,
+            last_skip: None,
+            logged_fov: false,
             events: xr::EventDataBuffer::new(),
             stats_since: Instant::now(),
             stats_frames: 0,
@@ -389,6 +393,7 @@ impl Vr {
         let mut refocus = false;
         while let Some(event) = self.instance.poll_event(&mut self.events)? {
             if let xr::Event::SessionStateChanged(change) = event {
+                log::info!("OpenXR session state: {:?}", change.state());
                 let focused = change.state() == xr::SessionState::FOCUSED;
                 refocus |= focused && !self.focused;
                 self.focused = focused;
@@ -415,6 +420,19 @@ impl Vr {
             self.recenter();
         }
         Ok(())
+    }
+
+    fn log_skipped_frame(&mut self, reason: &'static str, flags: Option<xr::ViewStateFlags>) {
+        let now = Instant::now();
+        if self.last_skip.is_none_or(|(previous, when)| {
+            previous != reason || now.duration_since(when) >= Duration::from_secs(5)
+        }) {
+            log::info!(
+                "OpenXR frame skipped: {reason}; running {}, focused {}, origin {}, view flags {:?}",
+                self.running, self.focused, self.origin.is_some(), flags
+            );
+            self.last_skip = Some((reason, now));
+        }
     }
 
     pub fn recenter(&mut self) {
@@ -477,6 +495,7 @@ impl Vr {
         let current = self.zoom_from + (self.zoom_to - self.zoom_from) * eased;
         let wanted = if active { 1.0 } else { 0.0 };
         if wanted != self.zoom_to {
+            log::info!("OpenXR zoom: {}", if active { "on (1.6x)" } else { "off (native FOV)" });
             self.zoom_from = current;
             self.zoom_to = wanted;
             self.zoom_changed = now;
@@ -563,6 +582,7 @@ impl Vr {
         }
         self.poll()?;
         if !self.running {
+            self.log_skipped_frame("session not running", None);
             return Ok(false);
         }
         if self.stats_frames == 0 {
@@ -573,6 +593,7 @@ impl Vr {
         let wait_time = wait_start.elapsed();
         self.frame_stream.begin()?;
         if !frame.should_render {
+            self.log_skipped_frame("runtime should_render=false", None);
             self.frame_stream
                 .end(frame.predicted_display_time, self.blend, &[])?;
             return Ok(false);
@@ -587,15 +608,27 @@ impl Vr {
                 .end(frame.predicted_display_time, self.blend, &[])?;
             bail!("OpenXR stopped providing stereo views");
         }
-        // A runtime may supply placeholder poses before tracking is ready.
-        // Never use those poses as the seated origin (which would add room height).
+        // Reject invalid poses, but do not require input focus or active tracking
+        // to render. Valid runtime poses can be inferred while tracking is lost,
+        // and VISIBLE sessions must render even without input focus. Refocusing
+        // still recenters the seated origin in poll().
         let valid = xr::ViewStateFlags::POSITION_VALID | xr::ViewStateFlags::ORIENTATION_VALID;
-        let tracked = xr::ViewStateFlags::POSITION_TRACKED | xr::ViewStateFlags::ORIENTATION_TRACKED;
-        if !view_state.contains(valid)
-            || (self.origin.is_none() && (!self.focused || !view_state.contains(tracked)))
-        {
+        if !view_state.contains(valid) {
+            self.log_skipped_frame("invalid view poses", Some(view_state));
             self.frame_stream.end(frame.predicted_display_time, self.blend, &[])?;
             return Ok(false);
+        }
+        if !self.logged_fov {
+            for (eye, view) in views.iter().enumerate() {
+                log::info!(
+                    "OpenXR eye {eye} native FOV: horizontal {:.1} deg, vertical {:.1} deg (left {:.1}, right {:.1}, down {:.1}, up {:.1})",
+                    (view.fov.angle_right - view.fov.angle_left).to_degrees(),
+                    (view.fov.angle_up - view.fov.angle_down).to_degrees(),
+                    view.fov.angle_left.to_degrees(), view.fov.angle_right.to_degrees(),
+                    view.fov.angle_down.to_degrees(), view.fov.angle_up.to_degrees(),
+                );
+            }
+            self.logged_fov = true;
         }
         let midpoint = (xr_position(views[0].pose) + xr_position(views[1].pose)) * 0.5;
         let raw_rotation = xr_rotation(views[0].pose);
@@ -800,12 +833,15 @@ impl Vr {
             .views(&projection_views);
         self.frame_stream
             .end(frame.predicted_display_time, self.blend, &[&layer])?;
+        if self.last_skip.take().is_some() {
+            log::info!("OpenXR stereo layer submitted; view flags {:?}", view_state);
+        }
         self.record_frame_stats(renderer, wait_time, render_start, gpu_wait_time);
         Ok(true)
     }
 
     /// Where the menu and the cursor hang in front of the eyes this frame: the menu before the
-    /// head while it is open, the cursor on the menu, on what it points at in the bus (kept in
+    /// head when opened and fixed there until closed, the cursor on the menu, on what it points at in the bus (kept in
     /// the bus's frame as it drives on) or before the eyes, hidden after ten idle seconds.
     #[allow(clippy::too_many_arguments)]
     fn place_cursor(&mut self, menu_open: bool, cockpit_pointer_enabled: bool, cursor_position: (f32, f32), desktop_size: (u32, u32), bus_pose: Option<(DVec3, Mat4)>, eye_cameras: &[Camera; 2], eye_projections: &[Mat4; 2], ui_cameras: &[Camera; 2], fov: xr::Fovf) {
@@ -829,7 +865,9 @@ impl Vr {
             self.last_cursor_move = Some(Instant::now());
             self.cursor_menu_open = false;
         }
-        if menu_open {
+        // Capture once on opening; the changing eye cameras project the fixed
+        // panel as the head moves. Recenter clears it so it can be placed again.
+        if menu_open && self.menu_anchor.is_none() {
             let center = (ui_cameras[0].position + ui_cameras[1].position) * 0.5
                 + (ui_cameras[0].forward() * 2.0).as_dvec3();
             self.menu_anchor = Some(UiAnchor::menu(
@@ -839,7 +877,7 @@ impl Vr {
                 2.0,
                 desktop_size,
             ));
-        } else {
+        } else if !menu_open {
             self.menu_anchor = None;
         }
         let moved = self.last_cursor_position.is_none_or(|p| {
